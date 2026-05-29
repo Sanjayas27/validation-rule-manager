@@ -4,7 +4,7 @@ import LoginPage from "./components/LoginPage";
 import Dashboard from "./components/Dashboard";
 import "./App.css";
 
-const API = "http://localhost:5000";
+const API = "https://validation-rule-manager-backend.onrender.com";
 axios.defaults.withCredentials = true;
 
 function App() {
