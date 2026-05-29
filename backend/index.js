@@ -239,7 +239,9 @@ app.patch("/api/validation-rules", requireAuth, async (req, res) => {
 
   res.json({ results });
 });
-
+app.get("/", (req, res) => {
+  res.json({ status: "Validation Rule Manager API is running" });
+});
 // ─── Start Server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅ Backend running at http://localhost:${PORT}`);
