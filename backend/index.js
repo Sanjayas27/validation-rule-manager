@@ -7,27 +7,42 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json());
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://validation-rule-manager.vercel.app",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
   })
 );
+
+app.set("trust proxy", 1);
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "secret",
     resave: false,
     saveUninitialized: false,
     cookie: {
-      secure: false, // set true in production with HTTPS
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
     },
   })
 );
 
-// ─── Auth Check Middleware ────────────────────────────────────────────────────
 function requireAuth(req, res, next) {
   if (!req.session.accessToken) {
     return res.status(401).json({ error: "Not authenticated" });
@@ -35,7 +50,10 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ─── 1. Initiate OAuth Login ──────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.json({ status: "Validation Rule Manager API is running" });
+});
+
 app.get("/auth/login", (req, res) => {
   const params = new URLSearchParams({
     response_type: "code",
@@ -43,21 +61,16 @@ app.get("/auth/login", (req, res) => {
     redirect_uri: process.env.SF_CALLBACK_URL,
     scope: "api full refresh_token",
   });
-
   const authUrl = `${process.env.SF_LOGIN_URL}/services/oauth2/authorize?${params}`;
   res.redirect(authUrl);
 });
 
-// ─── 2. OAuth Callback ────────────────────────────────────────────────────────
 app.get("/oauth/callback", async (req, res) => {
   const { code, error } = req.query;
 
   if (error) {
-    return res.redirect(
-      `${process.env.FRONTEND_URL}?error=${encodeURIComponent(error)}`
-    );
+    return res.redirect(`${process.env.FRONTEND_URL}?error=${encodeURIComponent(error)}`);
   }
-
   if (!code) {
     return res.redirect(`${process.env.FRONTEND_URL}?error=no_code`);
   }
@@ -77,12 +90,10 @@ app.get("/oauth/callback", async (req, res) => {
 
     const { access_token, refresh_token, instance_url, id } = tokenRes.data;
 
-    // Store in session
     req.session.accessToken = access_token;
     req.session.refreshToken = refresh_token;
     req.session.instanceUrl = instance_url;
 
-    // Get user info
     const userRes = await axios.get(id, {
       headers: { Authorization: `Bearer ${access_token}` },
     });
@@ -93,56 +104,42 @@ app.get("/oauth/callback", async (req, res) => {
       username: userRes.data.username,
     };
 
-    res.redirect(`${process.env.FRONTEND_URL}?login=success`);
+    req.session.save((err) => {
+      if (err) {
+        console.error("Session save error:", err);
+        return res.redirect(`${process.env.FRONTEND_URL}?error=session_error`);
+      }
+      res.redirect(`${process.env.FRONTEND_URL}?login=success`);
+    });
   } catch (err) {
     console.error("OAuth error:", err.response?.data || err.message);
     res.redirect(`${process.env.FRONTEND_URL}?error=oauth_failed`);
   }
 });
 
-// ─── 3. Check Auth Status ─────────────────────────────────────────────────────
 app.get("/auth/status", (req, res) => {
   if (req.session.accessToken) {
-    res.json({
-      authenticated: true,
-      user: req.session.userInfo,
-      instanceUrl: req.session.instanceUrl,
-    });
+    res.json({ authenticated: true, user: req.session.userInfo, instanceUrl: req.session.instanceUrl });
   } else {
     res.json({ authenticated: false });
   }
 });
 
-// ─── 4. Logout ────────────────────────────────────────────────────────────────
 app.post("/auth/logout", (req, res) => {
   req.session.destroy();
   res.json({ success: true });
 });
 
-// ─── 5. Get All Validation Rules ─────────────────────────────────────────────
 app.get("/api/validation-rules", requireAuth, async (req, res) => {
   try {
-    const query = `
-      SELECT Id, ValidationName, Active, Description, EntityDefinitionId
-      FROM ValidationRule
-      WHERE EntityDefinition.QualifiedApiName = 'Account'
-    `;
-
+    const query = `SELECT Id, ValidationName, Active, Description, EntityDefinitionId FROM ValidationRule WHERE EntityDefinition.QualifiedApiName = 'Account'`;
     const response = await axios.get(
       `${req.session.instanceUrl}/services/data/v59.0/tooling/query`,
-      {
-        params: { q: query },
-        headers: { Authorization: `Bearer ${req.session.accessToken}` },
-      }
+      { params: { q: query }, headers: { Authorization: `Bearer ${req.session.accessToken}` } }
     );
-
     const rules = response.data.records.map((rule) => ({
-      id: rule.Id,
-      name: rule.ValidationName,
-      active: rule.Active,
-      description: rule.Description || "",
+      id: rule.Id, name: rule.ValidationName, active: rule.Active, description: rule.Description || "",
     }));
-
     res.json({ rules });
   } catch (err) {
     console.error("Fetch rules error:", err.response?.data || err.message);
@@ -150,39 +147,19 @@ app.get("/api/validation-rules", requireAuth, async (req, res) => {
   }
 });
 
-// ─── 6. Toggle Single Validation Rule ────────────────────────────────────────
 app.patch("/api/validation-rules/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   const { active } = req.body;
-
   try {
-    // First get the full metadata of the rule
     const getRes = await axios.get(
       `${req.session.instanceUrl}/services/data/v59.0/tooling/sobjects/ValidationRule/${id}`,
-      {
-        headers: { Authorization: `Bearer ${req.session.accessToken}` },
-      }
+      { headers: { Authorization: `Bearer ${req.session.accessToken}` } }
     );
-
-    const existingMetadata = getRes.data.Metadata;
-
-    // Patch with updated active status
     await axios.patch(
       `${req.session.instanceUrl}/services/data/v59.0/tooling/sobjects/ValidationRule/${id}`,
-      {
-        Metadata: {
-          ...existingMetadata,
-          active: active,
-        },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${req.session.accessToken}`,
-          "Content-Type": "application/json",
-        },
-      }
+      { Metadata: { ...getRes.data.Metadata, active } },
+      { headers: { Authorization: `Bearer ${req.session.accessToken}`, "Content-Type": "application/json" } }
     );
-
     res.json({ success: true, id, active });
   } catch (err) {
     console.error("Toggle rule error:", err.response?.data || err.message);
@@ -190,59 +167,29 @@ app.patch("/api/validation-rules/:id", requireAuth, async (req, res) => {
   }
 });
 
-// ─── 7. Toggle ALL Validation Rules ──────────────────────────────────────────
 app.patch("/api/validation-rules", requireAuth, async (req, res) => {
   const { active, ids } = req.body;
-
-  if (!ids || !Array.isArray(ids)) {
-    return res.status(400).json({ error: "ids array required" });
-  }
-
+  if (!ids || !Array.isArray(ids)) return res.status(400).json({ error: "ids array required" });
   const results = [];
-
   for (const id of ids) {
     try {
       const getRes = await axios.get(
         `${req.session.instanceUrl}/services/data/v59.0/tooling/sobjects/ValidationRule/${id}`,
-        {
-          headers: { Authorization: `Bearer ${req.session.accessToken}` },
-        }
+        { headers: { Authorization: `Bearer ${req.session.accessToken}` } }
       );
-
-      const existingMetadata = getRes.data.Metadata;
-
       await axios.patch(
         `${req.session.instanceUrl}/services/data/v59.0/tooling/sobjects/ValidationRule/${id}`,
-        {
-          Metadata: {
-            ...existingMetadata,
-            active: active,
-          },
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${req.session.accessToken}`,
-            "Content-Type": "application/json",
-          },
-        }
+        { Metadata: { ...getRes.data.Metadata, active } },
+        { headers: { Authorization: `Bearer ${req.session.accessToken}`, "Content-Type": "application/json" } }
       );
-
       results.push({ id, success: true, active });
     } catch (err) {
-      results.push({
-        id,
-        success: false,
-        error: err.response?.data || err.message,
-      });
+      results.push({ id, success: false, error: err.response?.data || err.message });
     }
   }
-
   res.json({ results });
 });
-app.get("/", (req, res) => {
-  res.json({ status: "Validation Rule Manager API is running" });
-});
-// ─── Start Server ─────────────────────────────────────────────────────────────
+
 app.listen(PORT, () => {
   console.log(`✅ Backend running at http://localhost:${PORT}`);
 });
